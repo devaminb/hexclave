@@ -10,6 +10,7 @@ import { captureError, HexclaveAssertionError, throwErr } from "@hexclave/shared
 import { getEnvVariable } from "@hexclave/shared/dist/utils/env";
 import { omit } from "@hexclave/shared/dist/utils/objects";
 import { Result } from "@hexclave/shared/dist/utils/results";
+import { traceSpan } from "@/utils/telemetry";
 import type { ClickHouseClient } from "@clickhouse/client";
 import { Client } from 'pg';
 
@@ -1300,6 +1301,19 @@ async function updateClickhouseSyncMetadata(
   }));
 }
 
+async function fetchSourceRows<Row>(
+  internalPrisma: PrismaClientWithReplica,
+  fetchQuery: string,
+  tenancyId: string,
+  lastSequenceId: number,
+): Promise<Row[]> {
+  return await traceSpan("external-db-sync.fetch-source-rows", async (span) => {
+    const rows = await internalPrisma.$replica().$queryRawUnsafe<Row[]>(fetchQuery, tenancyId, lastSequenceId);
+    span.setAttribute("stack.external-db-sync.row-count", rows.length);
+    return rows;
+  });
+}
+
 
 async function syncPostgresMapping(
   externalClient: Client,
@@ -1324,13 +1338,15 @@ async function syncPostgresMapping(
   }
 
   const tableSchema = mapping.targetTableSchemas.postgres;
-  await ensureExternalSchema(externalClient, tableSchema, tableName);
+  await traceSpan("external-db-sync.postgres.ensure-schema", async () => {
+    await ensureExternalSchema(externalClient, tableSchema, tableName);
+  });
 
   let lastSequenceId = -1;
-  const metadataResult = await externalClient.query(
+  const metadataResult = await traceSpan("external-db-sync.postgres.read-sync-metadata", async () => await externalClient.query(
     `SELECT "last_synced_sequence_id" FROM "_stack_sync_metadata" WHERE "mapping_name" = $1`,
     [mappingId]
-  );
+  ));
   if (metadataResult.rows.length > 0) {
     lastSequenceId = Number(metadataResult.rows[0].last_synced_sequence_id);
   }
@@ -1350,7 +1366,7 @@ async function syncPostgresMapping(
     if (!Number.isFinite(lastSequenceId)) {
       throw new HexclaveAssertionError(`lastSequenceId must be a finite number for mapping ${mappingId}.`);
     }
-    const rows = await internalPrisma.$replica().$queryRawUnsafe<any[]>(fetchQuery, tenancyId, lastSequenceId);
+    const rows = await fetchSourceRows<any>(internalPrisma, fetchQuery, tenancyId, lastSequenceId);
 
     if (rows.length === 0) {
       break;
@@ -1359,14 +1375,16 @@ async function syncPostgresMapping(
       console.log("db-sync-postgres: more than 1 row returned from source db fetch", { tenancyId, numRows: rows.length });
     }
 
-    await pushRowsToExternalDb(
-      externalClient,
-      tableName,
-      rows,
-      updateQuery,
-      tenancyId,
-      mappingId,
-    );
+    await traceSpan("external-db-sync.postgres.push-rows", async () => {
+      await pushRowsToExternalDb(
+        externalClient,
+        tableName,
+        rows,
+        updateQuery,
+        tenancyId,
+        mappingId,
+      );
+    });
 
     // This watermark relies on sequencer allocation committing in sequence order; a visible
     // higher value must imply that every lower value is already visible to the source reader.
@@ -1419,7 +1437,10 @@ async function syncClickhouseMapping(
   }
 
   const clickhouseTableName = `analytics_internal.${mapping.targetTable}`;
-  let lastSequenceId = await getClickhouseLastSyncedSequenceId(client, tenancyId, mappingId);
+  let lastSequenceId = await traceSpan(
+    "external-db-sync.clickhouse.read-sync-metadata",
+    async () => await getClickhouseLastSyncedSequenceId(client, tenancyId, mappingId),
+  );
 
   const BATCH_LIMIT = 1000;
   const maxBatchesPerMapping = getMaxBatchesPerMapping();
@@ -1431,7 +1452,7 @@ async function syncClickhouseMapping(
     if (!Number.isFinite(lastSequenceId)) {
       throw new HexclaveAssertionError(`lastSequenceId must be a finite number for mapping ${mappingId}.`);
     }
-    const rows = await internalPrisma.$replica().$queryRawUnsafe<Record<string, unknown>[]>(fetchQuery, tenancyId, lastSequenceId);
+    const rows = await fetchSourceRows<Record<string, unknown>>(internalPrisma, fetchQuery, tenancyId, lastSequenceId);
 
     if (rows.length === 0) {
       break;
@@ -1440,13 +1461,15 @@ async function syncClickhouseMapping(
       console.log("db-sync-clickhouse: more than 1 row returned from source db fetch", { tenancyId, numRows: rows.length });
     }
 
-    await pushRowsToClickhouse(
-      client,
-      clickhouseTableName,
-      rows,
-      tenancyId,
-      mappingId,
-    );
+    await traceSpan("external-db-sync.clickhouse.push-rows", async () => {
+      await pushRowsToClickhouse(
+        client,
+        clickhouseTableName,
+        rows,
+        tenancyId,
+        mappingId,
+      );
+    });
 
     // This watermark relies on sequencer allocation committing in sequence order; a visible
     // higher value must imply that every lower value is already visible to the source reader.
@@ -1458,7 +1481,9 @@ async function syncClickhouseMapping(
       }
     }
     lastSequenceId = maxSeqInBatch;
-    await updateClickhouseSyncMetadata(client, tenancyId, mappingId, lastSequenceId);
+    await traceSpan("external-db-sync.clickhouse.write-sync-metadata", async () => {
+      await updateClickhouseSyncMetadata(client, tenancyId, mappingId, lastSequenceId);
+    });
 
     if (rows.length < BATCH_LIMIT) {
       break;
@@ -1500,26 +1525,33 @@ async function syncDatabase(
 
     let needsResync = false;
     const syncResult = await Result.fromPromise((async () => {
-      await externalClient.connect();
+      await traceSpan("external-db-sync.postgres.connect", async () => {
+        await externalClient.connect();
+      });
 
       // Always use DEFAULT_DB_SYNC_MAPPINGS - users cannot customize mappings
       // because internalDbFetchQuery runs against Hexclave's internal DB
       for (const [mappingId, mapping] of Object.entries(DEFAULT_DB_SYNC_MAPPINGS)) {
-        const mappingThrottled = await syncPostgresMapping(
+        const mappingThrottled = await traceSpan({
+          description: "external-db-sync.postgres.mapping",
+          attributes: { "stack.external-db-sync.mapping-id": mappingId },
+        }, async () => await syncPostgresMapping(
           externalClient,
           mappingId,
           mapping,
           internalPrisma,
           dbId,
           tenancyId,
-        );
+        ));
         if (mappingThrottled) {
           needsResync = true;
         }
       }
     })());
 
-    const closeResult = await Result.fromPromise(externalClient.end());
+    const closeResult = await Result.fromPromise(traceSpan("external-db-sync.postgres.close", async () => {
+      await externalClient.end();
+    }));
     if (closeResult.status === "error") {
       captureError(`external-db-sync-${dbId}-close`, closeResult.error);
     }
@@ -1541,7 +1573,7 @@ async function syncDatabase(
 export async function syncExternalDatabases(tenancy: Tenancy): Promise<boolean> {
   assertUuid(tenancy.id, "tenancy.id");
   const externalDatabases = tenancy.config.dbSync.externalDatabases;
-  const internalPrisma = await getPrismaClientForTenancy(tenancy);
+  const internalPrisma = await traceSpan("external-db-sync.get-prisma-client", async () => await getPrismaClientForTenancy(tenancy));
   let needsResync = false;
 
   // Always sync to ClickHouse if STACK_CLICKHOUSE_URL is set (not driven by config)
@@ -1550,20 +1582,25 @@ export async function syncExternalDatabases(tenancy: Tenancy): Promise<boolean> 
     const clickhouseClient = getClickhouseAdminClient();
     const syncResult = await Result.fromPromise((async () => {
       for (const [mappingId, mapping] of Object.entries(DEFAULT_DB_SYNC_MAPPINGS)) {
-        const mappingThrottled = await syncClickhouseMapping(
+        const mappingThrottled = await traceSpan({
+          description: "external-db-sync.clickhouse.mapping",
+          attributes: { "stack.external-db-sync.mapping-id": mappingId },
+        }, async () => await syncClickhouseMapping(
           clickhouseClient,
           mappingId,
           mapping,
           internalPrisma,
           tenancy.id,
-        );
+        ));
         if (mappingThrottled) {
           needsResync = true;
         }
       }
     })());
 
-    const closeResult = await Result.fromPromise(clickhouseClient.close());
+    const closeResult = await Result.fromPromise(traceSpan("external-db-sync.clickhouse.close", async () => {
+      await clickhouseClient.close();
+    }));
     if (closeResult.status === "error") {
       captureError("external-db-sync-clickhouse-close", closeResult.error);
     }
