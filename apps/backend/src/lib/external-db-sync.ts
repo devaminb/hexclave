@@ -2,7 +2,7 @@ import { Tenancy } from "@/lib/tenancies";
 import type { PrismaTransaction } from "@/lib/types";
 import { getPrismaClientForTenancy, PrismaClientWithReplica } from "@/prisma-client";
 import { Prisma } from "@/generated/prisma/client";
-import { getClickhouseAdminClient, withClickhousePreConnectionRetries } from "@/lib/clickhouse";
+import { getSharedClickhouseAdminClient, withClickhousePreConnectionRetries } from "@/lib/clickhouse";
 import { getSafeExternalPostgresClientOptions } from "@/lib/ssrf-protection/external-db-sync";
 import { DEFAULT_DB_SYNC_MAPPINGS } from "@hexclave/shared/dist/config/db-sync-mappings";
 import type { CompleteConfig } from "@hexclave/shared/dist/config/schema";
@@ -1240,40 +1240,53 @@ async function pushRowsToClickhouse(
   }));
 }
 
-async function getClickhouseLastSyncedSequenceId(
+/**
+ * Reads the ClickHouse watermarks of all mappings for a tenancy in one round trip
+ * (previously one query per mapping, which dominated no-op sync latency). Mappings
+ * without a row are absent from the map and start from -1.
+ *
+ * The snapshot is taken once before the mappings run. If a concurrent sync of the
+ * same tenancy advances a watermark in the meantime, we only re-push rows that
+ * were already pushed, which the ReplacingMergeTree target tables deduplicate; a
+ * stale watermark can never cause rows to be skipped.
+ */
+async function getClickhouseLastSyncedSequenceIds(
   client: ClickHouseClient,
   tenancyId: string,
-  mappingId: string,
-): Promise<number> {
+): Promise<Map<string, number>> {
   assertUuid(tenancyId, "tenancyId");
-  assertNonEmptyString(mappingId, "mappingId");
   const resultSet = await withClickhousePreConnectionRetries(() => client.query({
+    // _stack_sync_metadata is a ReplacingMergeTree, so unmerged older versions can
+    // still be present; argMax picks the newest per mapping. Ties on updated_at
+    // (two syncs finishing in the same instant) resolve to the higher watermark,
+    // which is safe because each sync only records a watermark after pushing
+    // every row up to it.
     query: `
-      SELECT last_synced_sequence_id
+      SELECT
+        mapping_name,
+        argMax(last_synced_sequence_id, (updated_at, last_synced_sequence_id)) AS last_synced_sequence_id
       FROM analytics_internal._stack_sync_metadata
       WHERE tenancy_id = {tenancy_id:UUID}
-        AND mapping_name = {mapping_name:String}
-      ORDER BY updated_at DESC
-      LIMIT 1
+      GROUP BY mapping_name
     `,
     query_params: {
       tenancy_id: tenancyId,
-      mapping_name: mappingId,
     },
     format: "JSONEachRow",
   }));
 
-  const result = await resultSet.json<{ last_synced_sequence_id: string }>();
-  if (result.length === 0) {
-    return -1;
+  const rows = await resultSet.json<{ mapping_name: string, last_synced_sequence_id: string }>();
+  const lastSyncedSequenceIds = new Map<string, number>();
+  for (const row of rows) {
+    const parsed = Number(row.last_synced_sequence_id);
+    if (!Number.isFinite(parsed)) {
+      throw new HexclaveAssertionError(
+        `Invalid last_synced_sequence_id for mapping ${row.mapping_name}: ${JSON.stringify(row.last_synced_sequence_id)}`
+      );
+    }
+    lastSyncedSequenceIds.set(row.mapping_name, parsed);
   }
-  const parsed = Number(result[0]?.last_synced_sequence_id);
-  if (!Number.isFinite(parsed)) {
-    throw new HexclaveAssertionError(
-      `Invalid last_synced_sequence_id for mapping ${mappingId}: ${JSON.stringify(result[0]?.last_synced_sequence_id)}`
-    );
-  }
-  return parsed;
+  return lastSyncedSequenceIds;
 }
 
 async function updateClickhouseSyncMetadata(
@@ -1417,6 +1430,7 @@ async function syncClickhouseMapping(
   mapping: DbSyncMapping,
   internalPrisma: PrismaClientWithReplica,
   tenancyId: string,
+  initialLastSequenceId: number,
 ): Promise<boolean> {
   assertNonEmptyString(mappingId, "mappingId");
   assertNonEmptyString(mapping.targetTable, "mapping.targetTable");
@@ -1437,10 +1451,7 @@ async function syncClickhouseMapping(
   }
 
   const clickhouseTableName = `analytics_internal.${mapping.targetTable}`;
-  let lastSequenceId = await traceSpan(
-    "external-db-sync.clickhouse.read-sync-metadata",
-    async () => await getClickhouseLastSyncedSequenceId(client, tenancyId, mappingId),
-  );
+  let lastSequenceId = initialLastSequenceId;
 
   const BATCH_LIMIT = 1000;
   const maxBatchesPerMapping = getMaxBatchesPerMapping();
@@ -1579,8 +1590,12 @@ export async function syncExternalDatabases(tenancy: Tenancy): Promise<boolean> 
   // Always sync to ClickHouse if STACK_CLICKHOUSE_URL is set (not driven by config)
   const clickhouseUrl = getEnvVariable("STACK_CLICKHOUSE_URL", "");
   if (clickhouseUrl) {
-    const clickhouseClient = getClickhouseAdminClient();
+    const clickhouseClient = getSharedClickhouseAdminClient();
     const syncResult = await Result.fromPromise((async () => {
+      const lastSyncedSequenceIds = await traceSpan(
+        "external-db-sync.clickhouse.read-sync-metadata",
+        async () => await getClickhouseLastSyncedSequenceIds(clickhouseClient, tenancy.id),
+      );
       for (const [mappingId, mapping] of Object.entries(DEFAULT_DB_SYNC_MAPPINGS)) {
         const mappingThrottled = await traceSpan({
           description: "external-db-sync.clickhouse.mapping",
@@ -1591,19 +1606,13 @@ export async function syncExternalDatabases(tenancy: Tenancy): Promise<boolean> 
           mapping,
           internalPrisma,
           tenancy.id,
+          lastSyncedSequenceIds.get(mappingId) ?? -1,
         ));
         if (mappingThrottled) {
           needsResync = true;
         }
       }
     })());
-
-    const closeResult = await Result.fromPromise(traceSpan("external-db-sync.clickhouse.close", async () => {
-      await clickhouseClient.close();
-    }));
-    if (closeResult.status === "error") {
-      captureError("external-db-sync-clickhouse-close", closeResult.error);
-    }
 
     if (syncResult.status === "error") {
       captureError("external-db-sync-clickhouse", syncResult.error);

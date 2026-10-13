@@ -19,6 +19,7 @@ export function createClickhouseClient(
   authType: "admin" | "external",
   database?: string,
   clickhouse_settings?: ClickHouseSettings,
+  options: { maxOpenConnections?: number } = {},
 ) {
   return createClient({
     url: getEnvVariable("STACK_CLICKHOUSE_URL"),
@@ -29,6 +30,7 @@ export function createClickhouseClient(
     database,
     request_timeout: 10 * 60 * 1000, // 10 minutes
     clickhouse_settings,
+    max_open_connections: options.maxOpenConnections,
   });
 }
 
@@ -81,6 +83,39 @@ export async function withClickhousePreConnectionRetries<T>(
 
 export function getClickhouseAdminClient() {
   return createClickhouseClient("admin", getEnvVariable("STACK_CLICKHOUSE_DATABASE", "default"));
+}
+
+// Each sync-engine call queries ClickHouse sequentially, so with ~40 concurrent
+// requests per instance this caps sockets near the actual concurrency instead of
+// the client's default of 10, which would queue requests inside the client.
+const SHARED_ADMIN_CLIENT_MAX_OPEN_CONNECTIONS = 64;
+let sharedClickhouseAdminClient: ClickHouseClient | undefined;
+
+/**
+ * Process-wide admin client for hot paths that run on nearly every request (e.g. the
+ * external DB sync engine). A fresh client per call pays a new TCP + TLS handshake
+ * for its first query; sharing one lets keep-alive sockets be reused across calls.
+ * Socket reuse is no riskier than before: a single sync already reused sockets
+ * across its sequential queries, and the client's default idle_socket_ttl (2.5s)
+ * drops idle sockets before the server's keep-alive timeout closes them.
+ *
+ * Callers must NOT close this client; graceful shutdown does via
+ * closeSharedClickhouseClients().
+ */
+export function getSharedClickhouseAdminClient(): ClickHouseClient {
+  sharedClickhouseAdminClient ??= createClickhouseClient(
+    "admin",
+    getEnvVariable("STACK_CLICKHOUSE_DATABASE", "default"),
+    undefined,
+    { maxOpenConnections: SHARED_ADMIN_CLIENT_MAX_OPEN_CONNECTIONS },
+  );
+  return sharedClickhouseAdminClient;
+}
+
+export async function closeSharedClickhouseClients(): Promise<void> {
+  const client = sharedClickhouseAdminClient;
+  sharedClickhouseAdminClient = undefined;
+  await client?.close();
 }
 
 const BOUNDED_ANALYTICS_CLICKHOUSE_SETTINGS: ClickHouseSettings = {

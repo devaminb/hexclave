@@ -1,4 +1,5 @@
 import { closeBackendInstrumentation } from "@/instrument";
+import { closeSharedClickhouseClients } from "@/lib/clickhouse";
 import { getTrustedProxy, validateStandaloneTrustedProxyConfiguration } from "@/lib/trusted-proxy";
 import "@/polyfills";
 import { disconnectPostgresPrismaClients } from "@/prisma-client";
@@ -118,7 +119,7 @@ function handleShutdownSignal(signal: NodeJS.Signals) {
     disconnectDatabases: async (timeoutMs) => await runShutdownOperationWithTimeout(
       "database disconnect",
       timeoutMs,
-      disconnectPostgresPrismaClients,
+      async () => await Promise.all([disconnectPostgresPrismaClients(), closeSharedClickhouseClients()]),
     ),
     closeInstrumentation: async (timeoutMs) => await closeBackendInstrumentation(timeoutMs),
     log: (event) => {
