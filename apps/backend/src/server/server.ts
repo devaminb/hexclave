@@ -7,6 +7,7 @@ import { getEnvVariable } from "@hexclave/shared/dist/utils/env";
 import { runAsynchronously } from "@hexclave/shared/dist/utils/promises";
 import type { Server as ElysiaServer } from "elysia/universal";
 import { app } from "./app";
+import { instanceRecycler, maxInstanceLifetimeEnvVar, parseInstanceRecyclingConfig } from "./instance-recycling";
 import { waitForNodeServerToListen } from "./node-server";
 import { getMaxRequestBodySizeBytes } from "./request-body-limit";
 import { backendShutdownBudget, runShutdownOperationWithTimeout, shutdownBackend } from "./shutdown";
@@ -54,9 +55,24 @@ const boundServerPromise = new Promise<ElysiaServer>((resolve, reject) => {
 
 let shutdownPromise: Promise<void> | undefined;
 
+const instanceRecyclingConfig = parseInstanceRecyclingConfig(getEnvVariable(maxInstanceLifetimeEnvVar, ""));
+
 runAsynchronously(boundServerPromise.then(() => {
   if (shutdownPromise == null) {
     console.log(`Hexclave backend listening on http://${hostname}:${port}`);
+  }
+  if (instanceRecyclingConfig != null) {
+    instanceRecycler.start({
+      config: instanceRecyclingConfig,
+      onDrained: () => {
+        // A platform SIGTERM may have arrived while we were draining; calling the
+        // handler a second time would force-exit with code 1.
+        if (shutdownPromise == null) {
+          handleShutdownSignal("SIGTERM");
+        }
+      },
+      log: (event) => console.log(JSON.stringify(event)),
+    });
   }
 }), {
   noErrorLogging: true,
