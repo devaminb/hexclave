@@ -182,7 +182,7 @@ export function getProjectConfigOverrideQuery(options: ProjectOptions): RawQuery
       if (queryResult.length > 1) {
         throw new HexclaveAssertionError(`Expected 0 or 1 project config overrides for project ${options.projectId}, got ${queryResult.length}`, { queryResult });
       }
-      return getCanonicalMigratedConfigOverride("project", queryResult[0]?.projectConfigOverride ?? {});
+      return getCanonicalMigratedConfigOverride({ level: "project", projectId: options.projectId }, queryResult[0]?.projectConfigOverride ?? {});
     },
   };
 }
@@ -201,7 +201,7 @@ export function getBranchConfigOverrideQuery(options: BranchOptions): RawQuery<P
       if (queryResult.length > 1) {
         throw new HexclaveAssertionError(`Expected 0 or 1 branch config overrides for project ${options.projectId} and branch ${options.branchId}, got ${queryResult.length}`, { queryResult });
       }
-      return getCanonicalMigratedConfigOverride("branch", queryResult[0]?.config ?? {});
+      return getCanonicalMigratedConfigOverride({ level: "branch", projectId: options.projectId, branchId: options.branchId }, queryResult[0]?.config ?? {});
     },
   };
   return fetchFromDbQuery;
@@ -225,7 +225,7 @@ export function getEnvironmentConfigOverrideQuery(options: EnvironmentOptions): 
       if (queryResult.length > 1) {
         throw new HexclaveAssertionError(`Expected 0 or 1 environment config overrides for project ${options.projectId} and branch ${options.branchId}, got ${queryResult.length}`, { queryResult });
       }
-      const storedConfigOverride = getCanonicalMigratedConfigOverride("environment", queryResult[0]?.config ?? {});
+      const storedConfigOverride = getCanonicalMigratedConfigOverride({ level: "environment", projectId: options.projectId, branchId: options.branchId }, queryResult[0]?.config ?? {});
       if (queryResult[0]?.isDevelopmentEnvironment === true) {
         // Memoized so that the merged override stays a canonical object, which the downstream rendering memos key on.
         return await developmentEnvironmentOverrideMemo.get(
@@ -249,7 +249,15 @@ export function getOrganizationConfigOverrideQuery(options: OrganizationOptions)
     readOnlyQuery: true,
     sql: Prisma.sql`SELECT 1`,
     postProcess: async () => {
-      return getCanonicalMigratedConfigOverride("organization", {});
+      return getCanonicalMigratedConfigOverride({
+        level: "organization",
+        projectId: options.projectId,
+        branchId: options.branchId,
+        // `forUserId` resolves to the null organization for now, matching the (empty) override this query returns for
+        // every user. Once organizations are implemented, this must become the user's resolved organization ID; it
+        // must not be the user ID itself, or every user would get their own cache entries.
+        organizationId: "forUserId" in options ? null : options.organizationId,
+      }, {});
     },
   };
 }

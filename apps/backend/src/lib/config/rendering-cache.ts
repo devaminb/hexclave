@@ -9,26 +9,24 @@
  *
  * How it works:
  *
- * 1. Each stored override is interned by a hash of its level and JSON content. Equal content always yields the same
- *    canonical (migrated) object, held in a bounded LRU.
+ * 1. Each stored override is interned per tenancy and level, together with a hash of its JSON content. As long as the
+ *    content is unchanged, the same canonical (migrated) object is returned. Entries live in a bounded LRU.
  * 2. Every later step is a pure function of canonical objects, so it is memoized by object identity in WeakMaps.
  *    Those entries live exactly as long as the canonical objects they were derived from, so the LRU in step 1 bounds
  *    the memory of the whole cache, and a changed override automatically produces fresh results downstream.
  *
- * All cached values are shared between concurrent requests (and between projects whose overrides are identical), so
- * they are deeply frozen. A caller that tries to mutate one gets a TypeError (all our modules are strict mode) instead
- * of silently leaking its change into other requests or tenants.
+ * Nothing is shared between tenancies (see {@link ConfigOverrideScope}), but cached values are shared between
+ * concurrent requests of the same tenancy, so they are deeply frozen. A caller that tries to mutate one gets a
+ * TypeError (all our modules are strict mode) instead of silently leaking its change into other requests.
  */
 import { migrateConfigOverride } from "@hexclave/shared/dist/config/schema";
 import { HexclaveAssertionError } from "@hexclave/shared/dist/utils/errors";
 import { deepPlainFreeze } from "@hexclave/shared/dist/utils/objects";
 import { createHash } from "node:crypto";
 
-export type ConfigOverrideLevel = "project" | "branch" | "environment" | "organization";
-
 /**
- * Upper bound on interned overrides per instance. Each project contributes roughly one entry per level, so this
- * comfortably covers the working set of an instance while bounding worst-case memory.
+ * Upper bound on interned overrides per instance. Each tenancy contributes one entry per level (four), so this covers
+ * about a thousand tenancies, comfortably more than the working set of an instance, while bounding worst-case memory.
  */
 const MAX_INTERNED_CONFIG_OVERRIDES = 4_000;
 
@@ -117,29 +115,64 @@ export class FrozenIdentityMemo<V> {
   }
 }
 
-// `any` mirrors the return type of `migrateConfigOverride`, whose result shape depends on the level; the callers in
-// ./index.tsx assign it to the level-specific override type, exactly as they did before this cache existed.
-const internedConfigOverrides = new LruMap<string, any>(MAX_INTERNED_CONFIG_OVERRIDES);
+/**
+ * The tenancy (and level) a config override was read for. It is part of every cache key, so cached values are never
+ * shared between tenancies, even if their stored overrides happen to be identical. That rules out cross-tenant timing
+ * side channels (a cache hit revealing that another tenant has the same config), and keeps the cache correct if
+ * rendering ever starts to depend on the tenancy and not just on the override content.
+ */
+export type ConfigOverrideScope =
+  | { level: "project", projectId: string }
+  | { level: "branch" | "environment", projectId: string, branchId: string }
+  | { level: "organization", projectId: string, branchId: string, organizationId: string | null };
+
+type InternedConfigOverride = {
+  contentHash: string,
+  // `any` mirrors the return type of `migrateConfigOverride`, whose result shape depends on the level; the callers in
+  // ./index.tsx assign it to the level-specific override type, exactly as they did before this cache existed.
+  migrated: any,
+};
+
+// One entry per scope: when a tenancy's stored override changes, its entry is replaced right away, which also releases
+// everything derived from the old version (see FrozenIdentityMemo).
+const internedConfigOverrides = new LruMap<string, InternedConfigOverride>(MAX_INTERNED_CONFIG_OVERRIDES);
+
+function getScopeKey(scope: ConfigOverrideScope): string {
+  // JSON array, so no ID can contain a separator that makes two different scopes produce the same key.
+  switch (scope.level) {
+    case "project": {
+      return JSON.stringify([scope.level, scope.projectId]);
+    }
+    case "branch":
+    case "environment": {
+      return JSON.stringify([scope.level, scope.projectId, scope.branchId]);
+    }
+    case "organization": {
+      return JSON.stringify([scope.level, scope.projectId, scope.branchId, scope.organizationId]);
+    }
+  }
+}
 
 /**
- * Migrates a config override as stored in the database and returns the canonical deep-frozen result for its content.
+ * Migrates a config override as stored in the database and returns the canonical deep-frozen result.
  *
- * Calls with equal `level` and JSON content return the identical object, which is what lets the downstream rendering
- * steps be memoized by identity (see {@link FrozenIdentityMemo}).
+ * Repeated calls for the same scope with equal JSON content return the identical object, which is what lets the
+ * downstream rendering steps be memoized by identity (see {@link FrozenIdentityMemo}).
  */
-export function getCanonicalMigratedConfigOverride(level: ConfigOverrideLevel, storedConfigOverride: unknown): any {
+export function getCanonicalMigratedConfigOverride(scope: ConfigOverrideScope, storedConfigOverride: unknown): any {
   const serialized = JSON.stringify(storedConfigOverride) as string | undefined;
   if (serialized === undefined) {
-    throw new HexclaveAssertionError("Stored config override is not JSON-serializable", { level });
+    throw new HexclaveAssertionError("Stored config override is not JSON-serializable", { scope });
   }
-  // Hashing keeps the LRU keys small even for large overrides; sha256 makes collisions (which would hand one
-  // override's config to another) practically impossible.
-  const key = `${level}:${createHash("sha256").update(serialized).digest("base64url")}`;
-  const cached = internedConfigOverrides.get(key);
-  if (cached !== undefined) return cached;
+  // A hash instead of the full JSON keeps entries small even for large overrides. SHA-256 makes it practically
+  // impossible for a changed override to hash the same as the cached version and be served stale.
+  const contentHash = createHash("sha256").update(serialized).digest("base64url");
+  const scopeKey = getScopeKey(scope);
+  const cached = internedConfigOverrides.get(scopeKey);
+  if (cached !== undefined && cached.contentHash === contentHash) return cached.migrated;
 
   // Migrate a private copy so the canonical object can never alias (and freeze) the caller's input.
-  const migrated = deepPlainFreeze(migrateConfigOverride(level, JSON.parse(serialized)));
-  internedConfigOverrides.set(key, migrated);
+  const migrated = deepPlainFreeze(migrateConfigOverride(scope.level, JSON.parse(serialized)));
+  internedConfigOverrides.set(scopeKey, { contentHash, migrated });
   return migrated;
 }
