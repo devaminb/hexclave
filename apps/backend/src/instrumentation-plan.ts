@@ -12,7 +12,13 @@ type BackendInstrumentationPlanOptions = {
 
 export type GoogleCloudTracePlan = {
   projectId: string,
+  /** Fraction of all traces that should end up in Cloud Trace (HEXCLAVE_GOOGLE_CLOUD_TRACE_SAMPLE_RATE). */
   sampleRate: number,
+  /**
+   * Trace-ID ratio the Cloud Trace span processor applies on top of the provider's own sampling decision, so that
+   * `tracesSampleRate * spanProcessorSampleRate === sampleRate`.
+   */
+  spanProcessorSampleRate: number,
 };
 
 export type BackendInstrumentationPlan = {
@@ -50,24 +56,33 @@ export function createBackendInstrumentationPlan(options: BackendInstrumentation
         ? `http://localhost:${options.portPrefix}31/v1/traces`
         : undefined;
 
-  const googleCloudTrace = createGoogleCloudTracePlan(options.googleCloudTraceSampleRate, options.otelResourceAttributes);
+  const googleCloudTraceTarget = parseGoogleCloudTraceTarget(options.googleCloudTraceSampleRate, options.otelResourceAttributes);
+
+  // Sentry owns the one global provider, so this single rate decides which traces every destination can see.
+  // - With Sentry enabled and Cloud Trace configured, the provider samples at the lower of the two rates. Recording
+  //   and sending a span to Sentry costs real CPU per request, and we only look at a few percent of traces anyway, so
+  //   there is no point in sampling (much) more than what Cloud Trace keeps. Errors are unaffected; Sentry reports
+  //   them independently of trace sampling.
+  // - A non-Sentry destination still needs sampled spans so its additional processor receives real data.
+  const tracesSampleRate = sentryEnabled
+    ? Math.min(options.sentryTracesSampleRate, googleCloudTraceTarget?.sampleRate ?? options.sentryTracesSampleRate)
+    : otlpTracesEndpoint == null && googleCloudTraceTarget == null ? 0 : 1;
 
   return {
-    googleCloudTrace,
+    googleCloudTrace: googleCloudTraceTarget == null ? undefined : {
+      ...googleCloudTraceTarget,
+      // The provider's decision is random per trace (Sentry's sample_rand) and the processor's filter is based on the
+      // trace ID, so the two are independent and their rates multiply. If Sentry samples less than Cloud Trace wants,
+      // Cloud Trace simply gets everything Sentry samples.
+      spanProcessorSampleRate: Math.min(1, googleCloudTraceTarget.sampleRate / tracesSampleRate),
+    },
     otlpTracesEndpoint,
     sentryEnabled,
-    // Sentry owns the one global provider. A non-Sentry destination still needs
-    // sampled spans so its additional processor receives real data. Cloud Trace
-    // applies its own trace-ID ratio on top of this provider-level decision, so
-    // its effective rate is sentryTracesSampleRate * its sample rate when Sentry
-    // is enabled.
-    tracesSampleRate: sentryEnabled
-      ? options.sentryTracesSampleRate
-      : otlpTracesEndpoint == null && googleCloudTrace == null ? 0 : 1,
+    tracesSampleRate,
   };
 }
 
-function createGoogleCloudTracePlan(sampleRateValue: string, otelResourceAttributes: string): GoogleCloudTracePlan | undefined {
+function parseGoogleCloudTraceTarget(sampleRateValue: string, otelResourceAttributes: string): Omit<GoogleCloudTracePlan, "spanProcessorSampleRate"> | undefined {
   if (sampleRateValue.trim() === "") {
     return undefined;
   }

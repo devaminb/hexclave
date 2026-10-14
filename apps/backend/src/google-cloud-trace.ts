@@ -21,16 +21,17 @@ export function createGoogleCloudTraceSpanProcessor(plan: GoogleCloudTracePlan):
       "x-goog-user-project": plan.projectId,
     }),
   });
-  return new TraceIdRatioFilteringSpanProcessor(
-    plan.sampleRate,
-    new BatchSpanProcessor(new ErrorReportingSpanExporter(exporter)),
-  );
+  const batchProcessor = new BatchSpanProcessor(new ErrorReportingSpanExporter(exporter));
+  return plan.spanProcessorSampleRate >= 1
+    ? batchProcessor
+    : new TraceIdRatioFilteringSpanProcessor(plan.spanProcessorSampleRate, batchProcessor);
 }
 
 /**
  * Forwards only spans whose trace ID falls into the configured ratio. Sentry owns
- * the global sampler (and samples far more than we want to pay Cloud Trace for),
- * so this sampling has to happen per processor rather than in the provider.
+ * the global sampler, which may sample more than we want to pay Cloud Trace for
+ * (e.g. everything, when Sentry is disabled but Cloud Trace is not), so this
+ * sampling has to happen per processor rather than in the provider.
  * Deciding on the trace ID (instead of randomly per span) keeps every span of a
  * sampled trace together, and matches what other services using the standard
  * TraceIdRatioBasedSampler would decide for the same trace.

@@ -149,7 +149,7 @@ describe("createBackendInstrumentationPlan", () => {
     })).toThrowErrorMatchingInlineSnapshot(`[Error: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT must use HTTP or HTTPS, got: "file:"]`);
   });
 
-  it("enables Cloud Trace alongside Sentry with the project ID from the resource attributes", () => {
+  it("lowers the shared sample rate to Cloud Trace's when it is enabled alongside Sentry", () => {
     expect(createBackendInstrumentationPlan({
       ...baseOptions,
       googleCloudTraceSampleRate: "0.05",
@@ -160,12 +160,43 @@ describe("createBackendInstrumentationPlan", () => {
         "googleCloudTrace": {
           "projectId": "my-project",
           "sampleRate": 0.05,
+          "spanProcessorSampleRate": 1,
+        },
+        "otlpTracesEndpoint": undefined,
+        "sentryEnabled": true,
+        "tracesSampleRate": 0.05,
+      }
+    `);
+  });
+
+  it("keeps Sentry's rate and forwards all its traces when Cloud Trace wants more than Sentry samples", () => {
+    expect(createBackendInstrumentationPlan({
+      ...baseOptions,
+      googleCloudTraceSampleRate: "0.5",
+      otelResourceAttributes: "gcp.project_id=my-project",
+      sentryDsn: "https://public@example.invalid/1",
+    })).toMatchInlineSnapshot(`
+      {
+        "googleCloudTrace": {
+          "projectId": "my-project",
+          "sampleRate": 0.5,
+          "spanProcessorSampleRate": 1,
         },
         "otlpTracesEndpoint": undefined,
         "sentryEnabled": true,
         "tracesSampleRate": 0.25,
       }
     `);
+  });
+
+  it("forwards everything Sentry samples to Cloud Trace even when Sentry samples nothing", () => {
+    expect(createBackendInstrumentationPlan({
+      ...baseOptions,
+      googleCloudTraceSampleRate: "0.05",
+      otelResourceAttributes: "gcp.project_id=my-project",
+      sentryDsn: "https://public@example.invalid/1",
+      sentryTracesSampleRate: 0,
+    })).toMatchObject({ tracesSampleRate: 0, googleCloudTrace: { spanProcessorSampleRate: 1 } });
   });
 
   it("records every trace for Cloud Trace's own ratio filter when Sentry is disabled", () => {
@@ -178,6 +209,7 @@ describe("createBackendInstrumentationPlan", () => {
         "googleCloudTrace": {
           "projectId": "my-project",
           "sampleRate": 0.05,
+          "spanProcessorSampleRate": 0.05,
         },
         "otlpTracesEndpoint": undefined,
         "sentryEnabled": false,
