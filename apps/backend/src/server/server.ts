@@ -8,6 +8,7 @@ import { getEnvVariable } from "@hexclave/shared/dist/utils/env";
 import { runAsynchronously } from "@hexclave/shared/dist/utils/promises";
 import type { Server as ElysiaServer } from "elysia/universal";
 import { app } from "./app";
+import { googleCloudProfilerEnabledEnvVar, parseGoogleCloudProfilerConfig, startGoogleCloudProfiler } from "./google-cloud-profiler";
 import { instanceRecycler, maxInstanceLifetimeEnvVar, parseInstanceRecyclingConfig } from "./instance-recycling";
 import { waitForNodeServerToListen } from "./node-server";
 import { getMaxRequestBodySizeBytes } from "./request-body-limit";
@@ -57,6 +58,16 @@ const boundServerPromise = new Promise<ElysiaServer>((resolve, reject) => {
 let shutdownPromise: Promise<void> | undefined;
 
 const instanceRecyclingConfig = parseInstanceRecyclingConfig(getEnvVariable(maxInstanceLifetimeEnvVar, ""));
+
+const googleCloudProfilerConfig = parseGoogleCloudProfilerConfig({
+  enabled: getEnvVariable(googleCloudProfilerEnabledEnvVar, ""),
+  cloudRunService: getEnvVariable("K_SERVICE", ""),
+  cloudRunRevision: getEnvVariable("K_REVISION", ""),
+});
+if (googleCloudProfilerConfig != null) {
+  // Profiling is diagnostics only: a failing agent is reported but must not take the server down.
+  runAsynchronously(startGoogleCloudProfiler(googleCloudProfilerConfig));
+}
 
 runAsynchronously(boundServerPromise.then(() => {
   if (shutdownPromise == null) {

@@ -85,3 +85,4 @@ allowBuilds:
   msgpackr-extract: true
   unrs-resolver: false
   better-sqlite3: true
+  pprof: true
