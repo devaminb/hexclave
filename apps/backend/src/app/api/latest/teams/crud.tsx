@@ -332,7 +332,7 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
         { createdAt: sortDirection },
         { teamId: sortDirection },
       ],
-      take: query.limit ? query.limit + 1 : 200,
+      take: query.limit ? query.limit + 1 : undefined,
       ...query.cursor ? {
         skip: 1,
         cursor: {
