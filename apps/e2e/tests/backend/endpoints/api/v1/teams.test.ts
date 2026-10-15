@@ -122,6 +122,25 @@ it("paginates teams across two pages without duplicates or skips", async ({ expe
   expect(page2.body.pagination?.next_cursor ?? null).toBeNull();
 });
 
+it("caps listing teams without a limit at 200", async ({ expect }) => {
+  await Project.createAndSwitch();
+
+  for (let batchStart = 0; batchStart < 201; batchStart += 20) {
+    const responses = await Promise.all(Array.from({ length: Math.min(20, 201 - batchStart) }, () => niceBackendFetch("/api/v1/teams", {
+      accessType: "server",
+      method: "POST",
+      body: { display_name: "Cap team" },
+    })));
+    for (const response of responses) {
+      expect(response.status).toBe(201);
+    }
+  }
+
+  const response = await niceBackendFetch("/api/v1/teams", { accessType: "server" });
+  expect(response.status).toBe(200);
+  expect(response.body.items).toHaveLength(200);
+});
+
 it("creates a team on the client", async ({ expect }) => {
   await Auth.fastSignUp();
   await Team.createWithCurrentAsCreator();
