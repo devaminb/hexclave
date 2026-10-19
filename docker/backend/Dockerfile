@@ -18,12 +18,11 @@ RUN apt-get update && \
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PNPM_HOME/bin:$PATH
 
-RUN corepack enable
-RUN corepack prepare pnpm@11.5.0 --activate
+RUN npm install --global --ignore-scripts corepack@0.36.0 && corepack enable
+RUN corepack prepare pnpm@11.28.6+sha512.55d90390c3b39042f1505a2697789f0256c6d95bb28bdd7cb731af1887c9f2629ef581acb9f4e4ec772024c8203c2aed22a03299b97103fdcf32668e905d0024 --activate
 # Pinned: unpinned global installs mean an upstream release can change image builds without a commit
 # here (turbo 2.10.11 changed prune's gitignore handling and broke this build).
-RUN pnpm add -g turbo@2.10.11
-RUN pnpm add -g tsx@4.23.12
+RUN pnpm add -g --ignore-scripts --config.minimumReleaseAge=10080 --config.minimumReleaseAgeStrict=true --config.trustPolicy=no-downgrade turbo@2.10.11
 
 
 # Prune stage
@@ -31,7 +30,7 @@ FROM base AS pruner
 
 COPY . .
 
-RUN tsx ./scripts/generate-sdks.ts
+RUN node ./scripts/generate-sdks.ts
 
 # Only prune backend (no dashboard). The SDK packages generated above are gitignored, so prune must
 # not honor .gitignore or their sources would be missing from out/full.
@@ -50,7 +49,7 @@ COPY .gitignore .
 COPY pnpm-workspace.yaml .
 COPY turbo.json .
 COPY configs ./configs
-COPY --from=pruner /app/scripts/postinstall-patch-next-async-debug-info.mjs ./scripts/
+COPY --from=pruner /app/scripts/postinstall-patch-next-async-debug-info.mjs /app/scripts/check-package-manager.mjs ./scripts/
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
 COPY --from=pruner /app/out/full/ .
