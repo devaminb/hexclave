@@ -14,7 +14,7 @@ import { teamsCrud } from "@hexclave/shared/dist/interface/crud/teams";
 import { captureError } from "@hexclave/shared/dist/utils/errors";
 import { userIdOrMeSchema, yupNumber, yupObject, yupString } from "@hexclave/shared/dist/schema-fields";
 import { validateBase64Image } from "@hexclave/shared/dist/utils/base64";
-import { StatusError, throwErr } from "@hexclave/shared/dist/utils/errors";
+import { HexclaveAssertionError, StatusError, throwErr } from "@hexclave/shared/dist/utils/errors";
 import { getOrUndefined } from "@hexclave/shared/dist/utils/objects";
 import { createLazyProxy } from "@hexclave/shared/dist/utils/proxies";
 import { isUuid } from "@hexclave/shared/dist/utils/uuids";
@@ -72,7 +72,7 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
     add_current_user: yupString().oneOf(["true", "false"]).optional().meta({ openapiField: { onlyShowInOperations: ['Create'], hidden: true } }),
     order_by: yupString().oneOf(["created_at"]).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: 'Field to order results by. Currently only `created_at` is supported.', exampleValue: 'created_at' } }),
     desc: yupString().oneOf(["true", "false"]).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: 'Whether to order results in descending order. Defaults to false (ascending).', exampleValue: 'false' } }),
-    limit: yupNumber().integer().min(1).max(maxListPageSize).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: `The maximum number of items to return (capped at ${maxListPageSize}). If omitted, at most ${maxListPageSize} teams are returned; if there are more, the response is paginated and \`pagination.next_cursor\` can be passed as \`cursor\` (together with \`limit\`) to fetch the rest.` } }),
+    limit: yupNumber().integer().min(1).max(maxListPageSize).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: `The maximum number of items to return (capped at ${maxListPageSize}). If omitted, all matching teams are returned unpaginated; this may be capped in the future, so prefer setting \`limit\` and following \`pagination.next_cursor\`.` } }),
     cursor: yupString().optional().test(
       "team-list-cursor",
       "cursor must be a `next_cursor` returned by a previous request",
@@ -336,7 +336,7 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
 
     const prisma = await getPrismaClientForTenancy(auth.tenancy);
     const sortDirection = query.desc === 'true' ? 'desc' : 'asc';
-    const limit = query.limit ?? maxListPageSize;
+    const limit = query.limit;
 
     let queryFilter: Prisma.TeamWhereInput | undefined;
     if (query.query) {
@@ -409,20 +409,33 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
         { teamId: sortDirection },
       ],
       // +1 to detect whether a next page exists without a separate count.
-      take: limit + 1,
+      take: limit == null ? undefined : limit + 1,
     });
 
-    const items = db.slice(0, limit).map(teamPrismaToCrud);
-    const hasMore = db.length > limit;
-
-    // Requests without `limit` predate pagination and keep the unpaginated shape when everything fits.
-    // When the default cap truncates the result, return a cursor so callers can tell there's more.
-    if (query.limit == null && !hasMore) {
+    // Requests without `limit` predate pagination and still get every matching team. We intend to cap them at
+    // `maxListPageSize` (returning a cursor to the rest), but that silently truncates results for callers that
+    // don't paginate, eg. older SDKs. Until we know who'd be affected, we only report the requests the cap would
+    // truncate.
+    if (limit == null) {
+      if (db.length > maxListPageSize) {
+        captureError("team-list-exceeds-planned-cap", new HexclaveAssertionError(`A team list request without \`limit\` returned more than ${maxListPageSize} teams, so it would be truncated once unlimited team lists are capped`, {
+          projectId: auth.tenancy.project.id,
+          branchId: auth.tenancy.branchId,
+          tenancyId: auth.tenancy.id,
+          accessType: auth.type,
+          userIdFilter: query.user_id ?? null,
+          hasQuery: query.query != null,
+          teamCount: db.length,
+        }));
+      }
       return {
-        items,
+        items: db.map(teamPrismaToCrud),
         is_paginated: false,
       };
     }
+
+    const items = db.slice(0, limit).map(teamPrismaToCrud);
+    const hasMore = db.length > limit;
 
     return {
       items,

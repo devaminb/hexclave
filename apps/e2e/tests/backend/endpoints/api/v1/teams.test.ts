@@ -154,52 +154,31 @@ async function listAllTeamIds(query: string, limit = 7) {
   return ids;
 }
 
-it("caps listing teams without a limit at 200 and returns a cursor to the rest", async ({ expect }) => {
+it("returns every team unpaginated when no limit is given, even past 200", async ({ expect }) => {
   await Project.createAndSwitch();
-
-  await createTeams(201);
+  const ids = await createTeams(201);
 
   const response = await niceBackendFetch("/api/v1/teams", { accessType: "server" });
   expect(response.status).toBe(200);
-  expect(response.body.is_paginated).toBe(true);
-  expect(response.body.items).toHaveLength(200);
-  const cursor = response.body.pagination?.next_cursor;
-  expect(cursor).toBe(`${response.body.items[199].created_at_millis}_${response.body.items[199].id}`);
-
-  const rest = await niceBackendFetch(`/api/v1/teams?limit=200&cursor=${encodeURIComponent(cursor)}`, { accessType: "server" });
-  expect(rest.status).toBe(200);
-  expect(rest.body.items).toHaveLength(1);
-  expect(rest.body.pagination?.next_cursor).toBeNull();
-}, 120_000);
-
-it("keeps the unpaginated response shape when exactly 200 teams match and no limit is given", async ({ expect }) => {
-  await Project.createAndSwitch();
-  await createTeams(200);
-
-  const response = await niceBackendFetch("/api/v1/teams", { accessType: "server" });
-  expect(response.status).toBe(200);
-  expect(response.body.items).toHaveLength(200);
   expect(response.body.is_paginated).toBe(false);
   expect(response.body.pagination).toBeUndefined();
+  expect(new Set(response.body.items.map((team: { id: string }) => team.id))).toEqual(new Set(ids));
+  expect(response.body.items).toHaveLength(201);
 }, 120_000);
 
-it("caps a user's teams at 200 without a limit, for client and server", async ({ expect }) => {
+it("returns all of a user's teams unpaginated when no limit is given, even past 200, for client and server", async ({ expect }) => {
   await Project.createAndSwitch();
   const { userId } = await Auth.fastSignUp();
   const ids = await createTeams(201, () => ({ creator_user_id: userId }));
-  // Teams the user isn't in must not count towards the cap.
   await createTeams(5);
 
   for (const accessType of ["client", "server"] as const) {
     const response = await niceBackendFetch("/api/v1/teams?user_id=me", { accessType });
     expect(response.status).toBe(200);
-    expect(response.body.is_paginated).toBe(true);
-    expect(response.body.items).toHaveLength(200);
-    expect(response.body.pagination.next_cursor).toMatch(new RegExp(`^\\d+_${response.body.items[199].id}$`));
-
-    const rest = await niceBackendFetch(`/api/v1/teams?user_id=me&limit=200&cursor=${encodeURIComponent(response.body.pagination.next_cursor)}`, { accessType });
-    expect(rest.body.items).toHaveLength(1);
-    expect(new Set([...response.body.items, ...rest.body.items].map((team: { id: string }) => team.id))).toEqual(new Set(ids));
+    expect(response.body.is_paginated).toBe(false);
+    expect(response.body.pagination).toBeUndefined();
+    expect(new Set(response.body.items.map((team: { id: string }) => team.id))).toEqual(new Set(ids));
+    expect(response.body.items).toHaveLength(201);
   }
 }, 120_000);
 

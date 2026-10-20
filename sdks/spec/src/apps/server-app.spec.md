@@ -195,7 +195,7 @@ Does not error.
 
 Arguments:
   options.userId: string? - filter by user membership
-  options.limit: number? - max results, 1 to 200. If omitted, at most 200 teams are returned.
+  options.limit: number? - max results, 1 to 200. If omitted, all teams are currently returned (may be capped at 200 in the future).
   options.cursor: string? - nextCursor of the previous page. Requires limit (the backend returns 400 otherwise).
   options.query: string? - free-text search; exact match on team ID (if it is a UUID), substring match on display name
   options.orderBy: "createdAt"? - sort field (sent as order_by=created_at)
@@ -215,8 +215,9 @@ Response:
   }
 
 nextCursor is pagination.next_cursor, or null if absent. Treat it as opaque (pass it back unchanged); it stays valid
-even if the team it was derived from is deleted later, so cached pages can be refetched after any team mutation. Without limit, the response has is_paginated: false and no
-pagination when all matching teams fit in 200; when they don't, the first 200 are returned with a next_cursor.
+even if the team it was derived from is deleted later, so cached pages can be refetched after any team mutation. Without limit, the backend currently returns every
+matching team with is_paginated: false and no pagination. It may later cap that at 200 and return a next_cursor to
+the rest, so implementations must keep reading pagination.next_cursor even when limit is omitted.
 Languages that can't attach a property to an array may instead expose listTeams() returning only the items, plus a
 page-returning variant (e.g. Swift's listTeamsPage, returning { items, nextCursor }).
 
