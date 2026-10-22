@@ -190,7 +190,7 @@ it("finds a user's team with getTeam even when the user is in more than 200 team
   }
   const newestTeam = teams[teams.length - 1];
 
-  // Without a limit, the backend returns every team unpaginated.
+  // Without a limit, the backend returns every team unpaginated (up to 500).
   const listedTeams = await user.listTeams();
   expect(listedTeams).toHaveLength(201);
   expect(listedTeams.nextCursor).toBeNull();

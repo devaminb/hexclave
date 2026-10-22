@@ -154,22 +154,32 @@ async function listAllTeamIds(query: string, limit = 7) {
   return ids;
 }
 
-it("returns every team unpaginated when no limit is given, even past 200", async ({ expect }) => {
+it("returns up to 500 teams unpaginated without a limit, and rejects the request past 500", async ({ expect }) => {
   await Project.createAndSwitch();
-  const ids = await createTeams(201);
+  const ids = await createTeams(500);
 
   const response = await niceBackendFetch("/api/v1/teams", { accessType: "server" });
   expect(response.status).toBe(200);
   expect(response.body.is_paginated).toBe(false);
   expect(response.body.pagination).toBeUndefined();
   expect(new Set(response.body.items.map((team: { id: string }) => team.id))).toEqual(new Set(ids));
-  expect(response.body.items).toHaveLength(201);
-}, 120_000);
+  expect(response.body.items).toHaveLength(500);
 
-it("returns all of a user's teams unpaginated when no limit is given, even past 200, for client and server", async ({ expect }) => {
+  ids.push(...await createTeams(1));
+  const tooMany = await niceBackendFetch("/api/v1/teams", { accessType: "server" });
+  expect(tooMany).toMatchInlineSnapshot();
+
+  // Paginating still reaches every team.
+  const paginated = await listAllTeamIds("order_by=created_at", 200);
+  expect(new Set(paginated)).toEqual(new Set(ids));
+  expect(paginated).toHaveLength(501);
+}, 300_000);
+
+it("applies the 500-team cap without a limit only to the user's own teams, for client and server", async ({ expect }) => {
   await Project.createAndSwitch();
   const { userId } = await Auth.fastSignUp();
-  const ids = await createTeams(201, () => ({ creator_user_id: userId }));
+  const ids = await createTeams(500, () => ({ creator_user_id: userId }));
+  // Teams the user isn't in must not count towards the cap.
   await createTeams(5);
 
   for (const accessType of ["client", "server"] as const) {
@@ -178,9 +188,16 @@ it("returns all of a user's teams unpaginated when no limit is given, even past 
     expect(response.body.is_paginated).toBe(false);
     expect(response.body.pagination).toBeUndefined();
     expect(new Set(response.body.items.map((team: { id: string }) => team.id))).toEqual(new Set(ids));
-    expect(response.body.items).toHaveLength(201);
+    expect(response.body.items).toHaveLength(500);
   }
-}, 120_000);
+
+  await createTeams(1, () => ({ creator_user_id: userId }));
+  for (const accessType of ["client", "server"] as const) {
+    const response = await niceBackendFetch("/api/v1/teams?user_id=me", { accessType });
+    expect(response.status).toBe(400);
+    expect(response.body).toContain("More than 500 teams match this request");
+  }
+}, 300_000);
 
 it("pages through teams in both directions without duplicates or skips", async ({ expect }) => {
   await Project.createAndSwitch();

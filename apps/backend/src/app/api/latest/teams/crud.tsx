@@ -14,13 +14,17 @@ import { teamsCrud } from "@hexclave/shared/dist/interface/crud/teams";
 import { captureError } from "@hexclave/shared/dist/utils/errors";
 import { userIdOrMeSchema, yupNumber, yupObject, yupString } from "@hexclave/shared/dist/schema-fields";
 import { validateBase64Image } from "@hexclave/shared/dist/utils/base64";
-import { HexclaveAssertionError, StatusError, throwErr } from "@hexclave/shared/dist/utils/errors";
+import { StatusError, throwErr } from "@hexclave/shared/dist/utils/errors";
 import { getOrUndefined } from "@hexclave/shared/dist/utils/objects";
 import { createLazyProxy } from "@hexclave/shared/dist/utils/proxies";
 import { isUuid } from "@hexclave/shared/dist/utils/uuids";
 import { addUserToTeam } from "../team-memberships/crud";
 
 const maxListPageSize = 200;
+// Requests without `limit` predate pagination and return every matching team unpaginated. Past this many we reject
+// them instead of truncating, since callers that don't paginate (eg. older SDKs) can't tell a truncated list apart
+// from a complete one. It's higher than `maxListPageSize` so that existing callers just above 200 teams keep working.
+const maxUnpaginatedListSize = 500;
 
 // A team list cursor is the position of the previous page's last team, `<createdAt millis>_<teamId>`, rather than just
 // its ID, so a page can still be (re)fetched after that team is deleted; eg. the SDK's caches refresh mounted pages
@@ -72,7 +76,7 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
     add_current_user: yupString().oneOf(["true", "false"]).optional().meta({ openapiField: { onlyShowInOperations: ['Create'], hidden: true } }),
     order_by: yupString().oneOf(["created_at"]).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: 'Field to order results by. Currently only `created_at` is supported.', exampleValue: 'created_at' } }),
     desc: yupString().oneOf(["true", "false"]).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: 'Whether to order results in descending order. Defaults to false (ascending).', exampleValue: 'false' } }),
-    limit: yupNumber().integer().min(1).max(maxListPageSize).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: `The maximum number of items to return (capped at ${maxListPageSize}). If omitted, all matching teams are returned unpaginated; this may be capped in the future, so prefer setting \`limit\` and following \`pagination.next_cursor\`.` } }),
+    limit: yupNumber().integer().min(1).max(maxListPageSize).optional().meta({ openapiField: { onlyShowInOperations: ['List'], description: `The maximum number of items to return (capped at ${maxListPageSize}). If omitted, all matching teams are returned unpaginated, unless more than ${maxUnpaginatedListSize} teams match, in which case the request fails with a 400 error; set \`limit\` and follow \`pagination.next_cursor\` instead.` } }),
     cursor: yupString().optional().test(
       "team-list-cursor",
       "cursor must be a `next_cursor` returned by a previous request",
@@ -408,25 +412,14 @@ export const teamsCrudHandlers = createLazyProxy(() => createCrudHandlers(teamsC
         { createdAt: sortDirection },
         { teamId: sortDirection },
       ],
-      // +1 to detect whether a next page exists without a separate count.
-      take: limit == null ? undefined : limit + 1,
+      // +1 to detect whether a next page exists (or, without `limit`, whether the unpaginated cap is exceeded)
+      // without a separate count.
+      take: (limit ?? maxUnpaginatedListSize) + 1,
     });
 
-    // Requests without `limit` predate pagination and still get every matching team. We intend to cap them at
-    // `maxListPageSize` (returning a cursor to the rest), but that silently truncates results for callers that
-    // don't paginate, eg. older SDKs. Until we know who'd be affected, we only report the requests the cap would
-    // truncate.
     if (limit == null) {
-      if (db.length > maxListPageSize) {
-        captureError("team-list-exceeds-planned-cap", new HexclaveAssertionError(`A team list request without \`limit\` returned more than ${maxListPageSize} teams, so it would be truncated once unlimited team lists are capped`, {
-          projectId: auth.tenancy.project.id,
-          branchId: auth.tenancy.branchId,
-          tenancyId: auth.tenancy.id,
-          accessType: auth.type,
-          userIdFilter: query.user_id ?? null,
-          hasQuery: query.query != null,
-          teamCount: db.length,
-        }));
+      if (db.length > maxUnpaginatedListSize) {
+        throw new StatusError(StatusError.BadRequest, `More than ${maxUnpaginatedListSize} teams match this request, which is too many to return without pagination. Set \`limit\` (at most ${maxListPageSize}) and pass each response's \`pagination.next_cursor\` as \`cursor\` to fetch the rest, or narrow the results with \`query\` or \`user_id\`.`);
       }
       return {
         items: db.map(teamPrismaToCrud),
