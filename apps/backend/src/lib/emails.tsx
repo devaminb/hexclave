@@ -5,9 +5,10 @@ import { DEFAULT_EMAIL_THEMES, DEFAULT_TEMPLATE_IDS } from '@hexclave/shared/dis
 import { UsersCrud } from '@hexclave/shared/dist/interface/crud/users';
 import { getEnvBoolean, getEnvVariable } from '@hexclave/shared/dist/utils/env';
 import { HexclaveAssertionError } from '@hexclave/shared/dist/utils/errors';
+import { escapeHtml } from '@hexclave/shared/dist/utils/html';
 import { Json } from '@hexclave/shared/dist/utils/json';
 import { runEmailQueueStep, serializeRecipient } from './email-queue-step';
-import { LowLevelEmailConfig, isSecureEmailPort } from './emails-low-level';
+import { LowLevelEmailConfig, isSecureEmailPort, lowLevelSendEmailDirectWithoutRetries } from './emails-low-level';
 import { Tenancy } from './tenancies';
 
 
@@ -75,6 +76,63 @@ export async function sendEmailToMany(options: {
   }
 }
 
+function getDefaultAuthEmailContent(templateType: keyof typeof DEFAULT_TEMPLATE_IDS, projectName: string, variables: Record<string, Json>) {
+  const requireString = (name: string): string => {
+    const value = variables[name];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      throw new HexclaveAssertionError('Default auth email is missing a required string variable', { templateType, variable: name });
+    }
+    return value;
+  };
+
+  let subject: string;
+  let paragraphs: string[];
+  let link: string;
+  switch (templateType) {
+    case 'magic_link': {
+      const otp = requireString('otp');
+      subject = `Sign in to ${projectName}: Your code is ${otp}`;
+      paragraphs = [`Sign in to ${projectName}`, 'Your one-time sign-in code is:', otp, 'Or use this link to sign in:'];
+      link = requireString('magicLink');
+      break;
+    }
+    case 'password_reset':
+      subject = `Reset your password at ${projectName}`;
+      paragraphs = [`Use this link to reset your password for ${projectName}:`];
+      link = requireString('passwordResetLink');
+      break;
+    case 'email_verification':
+      subject = `Verify your email at ${projectName}`;
+      paragraphs = [`Use this link to verify your email address for ${projectName}:`];
+      link = requireString('emailVerificationLink');
+      break;
+    case 'team_invitation':
+      subject = `You have been invited to join ${requireString('teamDisplayName')}`;
+      paragraphs = [`Use this link to accept your invitation to ${requireString('teamDisplayName')}:`];
+      link = requireString('teamInvitationLink');
+      break;
+    case 'sign_in_invitation':
+      subject = `You have been invited to sign in to ${projectName}`;
+      paragraphs = [`You have been invited to sign in to ${projectName}. Use this link:`];
+      link = requireString('signInInvitationLink');
+      break;
+    case 'payment_receipt':
+    case 'payment_failed':
+    case 'trial_will_end':
+      return null;
+    default:
+      throw new HexclaveAssertionError('Unknown default email template', { templateType: templateType satisfies never });
+  }
+
+  const footer = 'If you were not expecting this email, you can safely ignore it.';
+  return {
+    subject,
+    text: [...paragraphs, link, footer].join('\n\n'),
+    html: paragraphs.map(paragraph => `<p>${escapeHtml(paragraph)}</p>`).join('')
+      + `<p><a href="${escapeHtml(link)}">${escapeHtml(link)}</a></p><p>${escapeHtml(footer)}</p>`,
+  };
+}
+
 export async function sendEmailFromDefaultTemplate(options: {
   tenancy: Tenancy,
   user: UsersCrud["Admin"]["Read"] | null,
@@ -83,6 +141,29 @@ export async function sendEmailFromDefaultTemplate(options: {
   extraVariables: Record<string, Json>,
   shouldSkipDeliverabilityCheck: boolean,
 }) {
+  // Temporary renderer bypass for auth/invitation mail. Keep delivery in a tracked
+  // background task like the queue path; static content also ignores broken custom
+  // templates/themes. Direct SMTP intentionally skips outbox history and retries.
+  const content = getDefaultAuthEmailContent(options.templateType, options.tenancy.project.display_name, options.extraVariables);
+  if (content !== null) {
+    runAsynchronouslyAndWaitUntil(async () => {
+      const result = await lowLevelSendEmailDirectWithoutRetries({
+        tenancyId: options.tenancy.id,
+        emailConfig: await getEmailConfig(options.tenancy),
+        to: options.email,
+        ...content,
+      });
+      if (result.status === 'error') {
+        throw new HexclaveAssertionError('Failed to send default email without rendering', {
+          templateType: options.templateType,
+          errorType: result.error.errorType,
+        });
+      }
+      console.info('Sent default email without rendering.', { templateType: options.templateType });
+    });
+    return;
+  }
+
   const template = getDefaultEmailTemplate(options.tenancy, options.templateType);
 
   await sendEmailToMany({
@@ -237,3 +318,70 @@ import.meta.vitest?.test('normalizeEmail(...)', async ({ expect }) => {
   expect(() => normalizeEmail('test@multiple@domains.com')).toThrow();
   expect(() => normalizeEmail('invalid.email')).toThrow();
 });
+
+if (import.meta.vitest != null) {
+  const { test } = import.meta.vitest;
+  const link = 'https://example.com/callback?code=abcdef123456';
+  const cases: { templateType: keyof typeof DEFAULT_TEMPLATE_IDS, variables: Record<string, Json>, subject: string }[] = [
+    { templateType: 'magic_link', variables: { magicLink: link, otp: 'A1B2C3' }, subject: 'Sign in to Example: Your code is A1B2C3' },
+    { templateType: 'password_reset', variables: { passwordResetLink: link }, subject: 'Reset your password at Example' },
+    { templateType: 'email_verification', variables: { emailVerificationLink: link }, subject: 'Verify your email at Example' },
+    { templateType: 'team_invitation', variables: { teamInvitationLink: link, teamDisplayName: 'Example Team' }, subject: 'You have been invited to join Example Team' },
+    { templateType: 'sign_in_invitation', variables: { signInInvitationLink: link }, subject: 'You have been invited to sign in to Example' },
+  ];
+
+  test('default auth emails preserve subjects and usable links in both formats', ({ expect }) => {
+    for (const { templateType, variables, subject } of cases) {
+      const content = getDefaultAuthEmailContent(templateType, 'Example', variables);
+      if (content === null) throw new HexclaveAssertionError('Auth template unexpectedly produced no email content', { templateType });
+      expect(content.subject).toBe(subject);
+      expect(content.text).toContain(link);
+      expect(content.html).toContain(`<a href="${link}">${link}</a>`);
+    }
+    const magicLink = getDefaultAuthEmailContent('magic_link', 'Example', { magicLink: link, otp: 'A1B2C3' });
+    expect(magicLink?.text).toContain('\n\nA1B2C3\n\n');
+    expect(magicLink?.html.match(/>([A-Z0-9]{6})<\/p>/)?.[1]).toBe('A1B2C3');
+  });
+
+  test('default auth emails reject missing, blank, and non-string variables', ({ expect }) => {
+    const invalidValues: Json[] = ['', ' \n ', null, 123, false, [], {}];
+    for (const { templateType, variables } of cases) {
+      for (const name of Object.keys(variables)) {
+        const missingVariable = { ...variables };
+        delete missingVariable[name];
+        expect(() => getDefaultAuthEmailContent(templateType, 'Example', missingVariable)).toThrow(HexclaveAssertionError);
+        for (const value of invalidValues) {
+          expect(() => getDefaultAuthEmailContent(templateType, 'Example', { ...variables, [name]: value })).toThrow(HexclaveAssertionError);
+        }
+      }
+    }
+  });
+
+  test('default auth emails escape project names, team names, and URLs in HTML', ({ expect }) => {
+    const specialLink = 'https://example.com/callback?code=abc&label="<invite>"';
+    const escapedLink = 'https://example.com/callback?code=abc&amp;label=&quot;&lt;invite&gt;&quot;';
+    const magicLink = getDefaultAuthEmailContent('magic_link', '<Project & "Partners">', { magicLink: specialLink, otp: 'A1B2C3' });
+    const invitation = getDefaultAuthEmailContent('team_invitation', 'Example', { teamInvitationLink: specialLink, teamDisplayName: '<Team & "Friends">' });
+    expect(magicLink?.html).toContain('<p>Sign in to &lt;Project &amp; &quot;Partners&quot;&gt;</p>');
+    expect(invitation?.html).toContain('&lt;Team &amp; &quot;Friends&quot;&gt;');
+    for (const content of [magicLink, invitation]) {
+      expect(content?.html).toContain(`<a href="${escapedLink}">${escapedLink}</a>`);
+      expect(content?.html).not.toContain('<invite>');
+      expect(content?.text).toContain(specialLink);
+    }
+  });
+
+  test('payment emails remain on the template rendering path', ({ expect }) => {
+    expect([
+      getDefaultAuthEmailContent('payment_receipt', 'Example', {}),
+      getDefaultAuthEmailContent('payment_failed', 'Example', {}),
+      getDefaultAuthEmailContent('trial_will_end', 'Example', {}),
+    ]).toMatchInlineSnapshot(`
+      [
+        null,
+        null,
+        null,
+      ]
+    `);
+  });
+}
