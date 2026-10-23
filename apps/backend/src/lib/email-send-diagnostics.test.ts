@@ -72,4 +72,15 @@ describe("email send diagnostics", () => {
     expect(error).toHaveBeenNthCalledWith(1, expect.stringContaining('"phase":"configuration"'));
     expect(error).toHaveBeenNthCalledWith(2, expect.stringContaining('"errorType":"AUTH_FAILED"'));
   });
+
+  it("correlates later queue processing through the outbox delivery ID", () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const logEmail = createEmailSendDiagnosticLogger("email_verification", "delivery-one");
+
+    logEmail({ stage: "skipped", reason: "LIKELY_NOT_DELIVERABLE" });
+
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('"deliveryId":"delivery-one"'));
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('"requestId":null'));
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('"reason":"LIKELY_NOT_DELIVERABLE"'));
+  });
 });

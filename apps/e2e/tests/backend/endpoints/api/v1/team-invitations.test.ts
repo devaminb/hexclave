@@ -1,4 +1,5 @@
 import { expect } from "vitest";
+import { throwErr } from "@hexclave/shared/dist/utils/errors";
 import { it } from "../../../../helpers";
 import { Auth, InternalProjectKeys, Project, Team, User, backendContext, createMailbox, niceBackendFetch } from "../../../backend-helpers";
 
@@ -102,6 +103,31 @@ it("can send invitation", async ({ expect }) => {
       "headers": Headers { <some fields may have been hidden> },
     }
   `);
+});
+
+it("delivers invitations for teams with an empty display name", async ({ expect }) => {
+  await Project.createAndSwitch();
+  const team = await niceBackendFetch("/api/v1/teams", {
+    method: "POST",
+    accessType: "server",
+    body: { display_name: "" },
+  });
+  expect(team.status).toBe(201);
+
+  const mailbox = createMailbox();
+  const response = await niceBackendFetch("/api/v1/team-invitations/send-code", {
+    method: "POST",
+    accessType: "server",
+    body: {
+      email: mailbox.emailAddress,
+      team_id: team.body.id,
+      callback_url: "http://localhost:12345/some-callback-url",
+    },
+  });
+  expect(response.status).toBe(200);
+  const messages = await mailbox.waitForMessagesWithSubject("You have been invited to join");
+  const invitation = messages[0] ?? throwErr("Expected an invitation to the team with an empty display name");
+  expect(invitation.body?.text).toContain("http://localhost:12345/some-callback-url?code=");
 });
 
 it("grants 1 dashboard_admin seat when creating a team on the internal project", async ({ expect }) => {

@@ -7,6 +7,7 @@ import { arePlanLimitsEnforced, getBillingTeamId } from "@/lib/plan-entitlements
 import { getHexclaveServerApp } from "@/hexclave";
 import { ITEM_IDS } from "@hexclave/shared/dist/plans";
 import { getTenancy, Tenancy } from "@/lib/tenancies";
+import { DEFAULT_TEMPLATE_IDS } from "@hexclave/shared/dist/helpers/emails";
 import { getPrismaClientForTenancy, globalPrismaClient, retryTransaction, type PrismaClientTransaction } from "@/prisma-client";
 import { allPromisesAndWaitUntilEach, runAsynchronouslyAndWaitUntil } from "@/utils/background-tasks";
 import { withTraceSpan } from "@/utils/telemetry";
@@ -14,10 +15,11 @@ import { groupBy } from "@hexclave/shared/dist/utils/arrays";
 import { getEnvBoolean, getNodeEnvironment } from "@hexclave/shared/dist/utils/env";
 import { captureError, errorToNiceString, HexclaveAssertionError, throwErr } from "@hexclave/shared/dist/utils/errors";
 import { Json } from "@hexclave/shared/dist/utils/json";
-import { filterUndefined } from "@hexclave/shared/dist/utils/objects";
+import { filterUndefined, typedEntries } from "@hexclave/shared/dist/utils/objects";
 import { Result } from "@hexclave/shared/dist/utils/results";
 import { randomUUID } from "node:crypto";
 import { checkEmailWithEmailable, type EmailableCheckResult } from "./emailable";
+import { createEmailSendDiagnosticLogger } from "./email-send-diagnostics";
 import { lowLevelSendEmailDirectWithoutRetries } from "./emails-low-level";
 
 const MAX_RENDER_BATCH = 50;
@@ -691,11 +693,26 @@ type TenancyProcessingContext = {
   billingTeamId: string | null,
 };
 
+function createOutboxEmailLogger(row: EmailOutbox) {
+  const templateType = typedEntries(DEFAULT_TEMPLATE_IDS).find(([, id]) => id === row.emailProgrammaticCallTemplateId)?.[0] ?? null;
+  return createEmailSendDiagnosticLogger(templateType, row.id);
+}
+
 async function processTenancyBatch(batch: TenancySendBatch): Promise<void> {
   const tenancy = await getTenancy(batch.tenancyId) ?? throwErr("Tenancy not found in processTenancyBatch? Was the tenancy deletion not cascaded?");
 
   const prisma = await getPrismaClientForTenancy(tenancy);
-  const emailConfig = await getEmailConfig(tenancy);
+  for (const row of batch.rows) {
+    createOutboxEmailLogger(row)({ stage: "config-loading" });
+  }
+  const configResult = await Result.fromPromise(getEmailConfig(tenancy));
+  if (configResult.status === "error") {
+    for (const row of batch.rows) {
+      createOutboxEmailLogger(row)({ stage: "failed", phase: "configuration", errorType: "EMAIL_CONFIGURATION_ERROR", canRetry: false });
+    }
+    throw configResult.error;
+  }
+  const emailConfig = configResult.data;
   const billingTeamId = getBillingTeamId(tenancy.project);
 
   const context: TenancyProcessingContext = {
@@ -722,23 +739,28 @@ type ResolvedRecipient =
   | { status: "unsubscribe" };
 
 async function processSingleEmail(context: TenancyProcessingContext, row: EmailOutbox): Promise<void> {
+  const logEmail = createOutboxEmailLogger(row);
+  const transport = { serverType: context.emailConfig.type, smtpPort: context.emailConfig.port, secure: context.emailConfig.secure };
   try {
     const recipient = deserializeRecipient(row.to as Json);
     const resolution = await resolveRecipientEmails(context, row, recipient);
 
     if (resolution.status === "skip") {
       await markSkipped(row, resolution.reason, resolution.details);
+      logEmail({ stage: "skipped", reason: resolution.reason });
       return;
     }
 
     if (resolution.status === "unsubscribe") {
       await markSkipped(row, EmailOutboxSkippedReason.USER_UNSUBSCRIBED);
+      logEmail({ stage: "skipped", reason: EmailOutboxSkippedReason.USER_UNSUBSCRIBED });
       return;
     }
 
     // Verify email deliverability for each email address
     // If any email fails verification, skip the entire email with LIKELY_NOT_DELIVERABLE reason
     // TODO: In the future, if only one email fails verification, we may still want to send if the other emails are deliverable
+    logEmail({ stage: "deliverability-check" });
     for (const email of resolution.emails) {
       const verifyResult = await verifyEmailDeliverability(
         email,
@@ -750,6 +772,7 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
           emailableResponse: verifyResult.emailableResponse,
           email,
         });
+        logEmail({ stage: "skipped", reason: EmailOutboxSkippedReason.LIKELY_NOT_DELIVERABLE });
         return;
       }
     }
@@ -769,12 +792,14 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
             blockedDomain,
             email,
           });
+          logEmail({ stage: "skipped", reason: EmailOutboxSkippedReason.LIKELY_NOT_DELIVERABLE });
           return;
         }
       }
     }
 
     if (context.billingTeamId != null && row.sendRetries === 0 && arePlanLimitsEnforced()) {
+      logEmail({ stage: "quota-check" });
       // The monthly-email quota lives in bulldozer, but email delivery must not
       // hard-depend on it: if bulldozer is unreachable, report it and send the
       // email anyway (treat the quota as available) rather than failing
@@ -819,6 +844,7 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
               shouldUpdateSequenceId: true,
             },
           });
+          logEmail({ stage: "failed", phase: "quota", errorType: "monthly-email-limit-exceeded", canRetry: false });
           return;
         }
 
@@ -866,7 +892,11 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
       ? wrapSharedDevEmail(baseContent)
       : baseContent;
 
-    const result = getEnvBoolean("STACK_EMAIL_BRANCHING_DISABLE_QUEUE_SENDING")
+    const sendingDisabled = getEnvBoolean("STACK_EMAIL_BRANCHING_DISABLE_QUEUE_SENDING");
+    if (!sendingDisabled) {
+      logEmail({ stage: "smtp-started", ...transport });
+    }
+    const result = sendingDisabled
       ? Result.error({ errorType: "email-sending-disabled", canRetry: false, message: "Email sending is disabled", rawError: new Error("Email sending is disabled") })
       : await lowLevelSendEmailDirectWithoutRetries({
         tenancyId: context.tenancy.id,
@@ -877,6 +907,7 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
         text: emailContent.text,
       });
     if (result.status === "error") {
+      logEmail({ stage: "failed", phase: "smtp", errorType: result.error.errorType, canRetry: result.error.canRetry });
       const newAttemptCount = row.sendRetries + 1;
       const isAttemptsExhausted = result.error.canRetry && newAttemptCount >= MAX_SEND_ATTEMPTS;
       const canRetry = result.error.canRetry && !isAttemptsExhausted;
@@ -955,6 +986,7 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
         });
       }
     } else {
+      logEmail({ stage: "smtp-accepted", ...transport });
       // Success - mark as sent (don't increment sendRetries since this wasn't a failure)
       await globalPrismaClient.emailOutbox.update({
         where: {
@@ -977,6 +1009,7 @@ async function processSingleEmail(context: TenancyProcessingContext, row: EmailO
 
     }
   } catch (error) {
+    logEmail({ stage: "failed", phase: "delivery", errorType: "UNEXPECTED_DELIVERY_ERROR", canRetry: false });
     captureError("email-queue-step-sending-single-error", error);
     await globalPrismaClient.emailOutbox.update({
       where: {

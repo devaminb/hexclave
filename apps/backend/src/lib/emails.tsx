@@ -4,13 +4,15 @@ import { EmailOutboxCreatedWith } from '@/generated/prisma/client';
 import { DEFAULT_EMAIL_THEMES, DEFAULT_TEMPLATE_IDS } from '@hexclave/shared/dist/helpers/emails';
 import { UsersCrud } from '@hexclave/shared/dist/interface/crud/users';
 import { getEnvBoolean, getEnvVariable } from '@hexclave/shared/dist/utils/env';
-import { HexclaveAssertionError } from '@hexclave/shared/dist/utils/errors';
+import { HexclaveAssertionError, throwErr } from '@hexclave/shared/dist/utils/errors';
 import { escapeHtml } from '@hexclave/shared/dist/utils/html';
 import { Json } from '@hexclave/shared/dist/utils/json';
-import { Result } from '@hexclave/shared/dist/utils/results';
+import { randomUUID } from 'node:crypto';
 import { createEmailSendDiagnosticLogger } from './email-send-diagnostics';
+import { createTemplateComponentFromHtml } from './email-rendering';
 import { runEmailQueueStep, serializeRecipient } from './email-queue-step';
-import { LowLevelEmailConfig, isSecureEmailPort, lowLevelSendEmailDirectWithoutRetries } from './emails-low-level';
+import { LowLevelEmailConfig, isSecureEmailPort } from './emails-low-level';
+import { getNotificationCategoryByName } from './notification-categories';
 import { Tenancy } from './tenancies';
 
 
@@ -71,6 +73,10 @@ export async function sendEmailToMany(options: {
     })),
   });
 
+  triggerEmailQueue();
+}
+
+function triggerEmailQueue() {
   if (!getEnvBoolean("STACK_EMAIL_BRANCHING_DISABLE_QUEUE_AUTO_TRIGGER")) {
     // The cron job should run runEmailQueueStep() to process the emails, but we call it here again for those self-hosters
     // who didn't set up the cron job correctly, and also just in case something happens to the cron job.
@@ -79,9 +85,9 @@ export async function sendEmailToMany(options: {
 }
 
 function getDefaultAuthEmailContent(templateType: keyof typeof DEFAULT_TEMPLATE_IDS, projectName: string, variables: Record<string, Json>) {
-  const requireString = (name: string): string => {
+  const requireString = (name: string, { nonEmpty = true } = {}): string => {
     const value = variables[name];
-    if (typeof value !== 'string' || value.trim().length === 0) {
+    if (typeof value !== 'string' || (nonEmpty && value.trim().length === 0)) {
       throw new HexclaveAssertionError('Default auth email is missing a required string variable', { templateType, variable: name });
     }
     return value;
@@ -111,8 +117,9 @@ function getDefaultAuthEmailContent(templateType: keyof typeof DEFAULT_TEMPLATE_
       break;
     }
     case 'team_invitation': {
-      subject = `You have been invited to join ${requireString('teamDisplayName')}`;
-      paragraphs = [`Use this link to accept your invitation to ${requireString('teamDisplayName')}:`];
+      const teamName = requireString('teamDisplayName', { nonEmpty: false });
+      subject = `You have been invited to join ${teamName}`;
+      paragraphs = [`Use this link to accept your invitation to ${teamName}:`];
       link = requireString('teamInvitationLink');
       break;
     }
@@ -149,44 +156,45 @@ export async function sendEmailFromDefaultTemplate(options: {
   extraVariables: Record<string, Json>,
   shouldSkipDeliverabilityCheck: boolean,
 }) {
-  // Temporary renderer bypass for auth/invitation mail. Keep delivery in a tracked
-  // background task like the queue path; static content also ignores broken custom
-  // templates/themes. Direct SMTP intentionally skips outbox history and retries.
+  // Static auth content bypasses template execution, while a completed render in
+  // the outbox keeps quota accounting, deliverability checks, and retries shared
+  // with every other email. A worker must never claim these rows for rendering.
   const logEmail = createEmailSendDiagnosticLogger(options.templateType);
   logEmail({ stage: 'preparing' });
   const content = getDefaultAuthEmailContent(options.templateType, options.tenancy.project.display_name, options.extraVariables);
   if (content !== null) {
-    runAsynchronouslyAndWaitUntil(async () => {
-      logEmail({ stage: 'config-loading' });
-      const configResult = await Result.fromPromise(getEmailConfig(options.tenancy));
-      if (configResult.status === 'error') {
-        logEmail({ stage: 'failed', phase: 'configuration', errorType: 'EMAIL_CONFIGURATION_ERROR', canRetry: false });
-        throw configResult.error;
-      }
-      const emailConfig = configResult.data;
-      const transport = { serverType: emailConfig.type, smtpPort: emailConfig.port, secure: emailConfig.secure };
-      logEmail({ stage: 'smtp-started', ...transport });
-      const sendResult = await Result.fromPromise(lowLevelSendEmailDirectWithoutRetries({
+    const category = getNotificationCategoryByName('Transactional') ?? throwErr('The built-in Transactional notification category must exist for auth emails');
+    const recipient: EmailOutboxRecipient = options.user == null
+      ? { type: 'custom-emails', emails: [options.email] }
+      : { type: 'user-custom-emails', userId: options.user.id, emails: [options.email] };
+    const renderedAt = new Date();
+    const outbox = await globalPrismaClient.emailOutbox.create({
+      data: {
         tenancyId: options.tenancy.id,
-        emailConfig,
-        to: options.email,
-        ...content,
-      }));
-      if (sendResult.status === 'error') {
-        logEmail({ stage: 'failed', phase: 'smtp', errorType: 'SMTP_EXCEPTION', canRetry: false });
-        throw sendResult.error;
-      }
-      const result = sendResult.data;
-      if (result.status === 'error') {
-        logEmail({ stage: 'failed', phase: 'smtp', errorType: result.error.errorType, canRetry: result.error.canRetry });
-        throw new HexclaveAssertionError('Failed to send default email without rendering', {
-          templateType: options.templateType,
-          errorType: result.error.errorType,
-        });
-      }
-      logEmail({ stage: 'smtp-accepted', ...transport });
-      console.info('Sent default email without rendering.', { templateType: options.templateType });
+        to: serializeRecipient(recipient) ?? throwErr('A default email recipient must serialize to a non-null JSON value'),
+        tsxSource: createTemplateComponentFromHtml(content.html),
+        themeId: null,
+        extraRenderVariables: options.extraVariables,
+        createdWith: EmailOutboxCreatedWith.PROGRAMMATIC_CALL,
+        emailProgrammaticCallTemplateId: DEFAULT_TEMPLATE_IDS[options.templateType],
+        overrideSubject: content.subject,
+        overrideNotificationCategoryId: category.id,
+        isHighPriority: true,
+        shouldSkipDeliverabilityCheck: options.shouldSkipDeliverabilityCheck,
+        scheduledAt: renderedAt,
+        renderedByWorkerId: randomUUID(),
+        startedRenderingAt: renderedAt,
+        finishedRenderingAt: renderedAt,
+        renderedSubject: content.subject,
+        renderedHtml: content.html,
+        renderedText: content.text,
+        renderedIsTransactional: true,
+        renderedNotificationCategoryId: category.id,
+      },
+      select: { id: true },
     });
+    logEmail({ stage: 'queued', deliveryId: outbox.id });
+    triggerEmailQueue();
     return;
   }
 
@@ -346,7 +354,7 @@ import.meta.vitest?.test('normalizeEmail(...)', async ({ expect }) => {
 });
 
 if (import.meta.vitest != null) {
-  const { test } = import.meta.vitest;
+  const { test, expect } = import.meta.vitest;
   const link = 'https://example.com/callback?code=abcdef123456';
   const cases: { templateType: keyof typeof DEFAULT_TEMPLATE_IDS, variables: Record<string, Json>, subject: string }[] = [
     { templateType: 'magic_link', variables: { magicLink: link, otp: 'A1B2C3' }, subject: 'Sign in to Example: Your code is A1B2C3' },
@@ -369,10 +377,12 @@ if (import.meta.vitest != null) {
     expect(magicLink?.html.match(/>([A-Z0-9]{6})<\/p>/)?.[1]).toBe('A1B2C3');
   });
 
-  test('default auth emails reject missing, blank, and non-string variables', ({ expect }) => {
-    const invalidValues: Json[] = ['', ' \n ', null, 123, false, [], {}];
+  test('default auth emails reject missing variables and invalid codes or links', ({ expect }) => {
     for (const { templateType, variables } of cases) {
       for (const name of Object.keys(variables)) {
+        const invalidValues: Json[] = name === 'teamDisplayName'
+          ? [null, 123, false, [], {}]
+          : ['', ' \n ', null, 123, false, [], {}];
         const missingVariable = { ...variables };
         delete missingVariable[name];
         expect(() => getDefaultAuthEmailContent(templateType, 'Example', missingVariable)).toThrow(HexclaveAssertionError);
@@ -381,6 +391,13 @@ if (import.meta.vitest != null) {
         }
       }
     }
+  });
+
+  test.each(['', ' \n '])('team invitations accept the valid display name %j', (teamDisplayName) => {
+    const content = getDefaultAuthEmailContent('team_invitation', 'Example', { teamInvitationLink: link, teamDisplayName });
+    expect(content?.subject).toBe(`You have been invited to join ${teamDisplayName}`);
+    expect(content?.text).toContain(link);
+    expect(content?.html).toContain(`<a href="${link}">${link}</a>`);
   });
 
   test('default auth emails escape project names, team names, and URLs in HTML', ({ expect }) => {

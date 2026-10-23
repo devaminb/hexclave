@@ -76,6 +76,52 @@ async function applyManagedEmailDomain(options: { subdomain: string, senderLocal
 }
 
 describe("emailable deliverability gating", () => {
+  it("checks static signup verification emails sent through the shared server", async ({ expect }) => {
+    await Project.createAndSwitch({ display_name: "Shared Signup Verification" });
+
+    const response = await niceBackendFetch("/api/v1/auth/password/sign-up", {
+      method: "POST",
+      accessType: "client",
+      body: {
+        email: NOT_DELIVERABLE_EMAIL,
+        password: "signup-verification-test-password",
+        verification_callback_url: "http://localhost:12345/some-callback-url",
+      },
+    });
+    expect(response.status).toBe(200);
+
+    const emails = await waitForOutboxEmailWithStatus("Verify your email at Shared Signup Verification", "skipped");
+    expect(emails[0]).toMatchObject({
+      skipped_reason: "LIKELY_NOT_DELIVERABLE",
+      skip_deliverability_check: false,
+      has_rendered: true,
+      is_transactional: true,
+    });
+  });
+
+  it("checks static signup verification emails sent through a managed domain", async ({ expect }) => {
+    await Project.createAndSwitch({ display_name: "Managed Signup Verification" });
+    await applyManagedEmailDomain({ subdomain: "signup.example.com", senderLocalPart: "noreply" });
+
+    const response = await niceBackendFetch("/api/v1/auth/password/sign-up", {
+      method: "POST",
+      accessType: "client",
+      body: {
+        email: NOT_DELIVERABLE_EMAIL,
+        password: "signup-verification-test-password",
+        verification_callback_url: "http://localhost:12345/some-callback-url",
+      },
+    });
+    expect(response.status).toBe(200);
+
+    const emails = await waitForOutboxEmailWithStatus("Verify your email at Managed Signup Verification", "skipped");
+    expect(emails[0]).toMatchObject({
+      skipped_reason: "LIKELY_NOT_DELIVERABLE",
+      skip_deliverability_check: false,
+      has_rendered: true,
+    });
+  });
+
   it("runs the deliverability check on the shared email server (undeliverable address is skipped)", async ({ expect }) => {
     // A fresh project defaults to the shared email server.
     await Project.createAndSwitch({ display_name: "Shared Deliverability Project" });
