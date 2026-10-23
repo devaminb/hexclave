@@ -40,7 +40,9 @@ FROM base AS builder
 # Skip generate-sdks.ts in preinstall hook (file not available in pruned output)
 ENV HEXCLAVE_SKIP_TEMPLATE_GENERATION=true
 
-# copy over package.json files and install dependencies
+# Copy the complete pruned tree before installing. pnpm's pre-run dependency
+# check tracks patch-file timestamps, so overlaying out/full after a cached
+# install can report unchanged patches as modified on the next build.
 COPY --from=pruner /app/out/json/ .
 COPY --from=pruner /app/out/pnpm-lock.yaml .
 COPY .gitignore .
@@ -48,10 +50,8 @@ COPY pnpm-workspace.yaml .
 COPY turbo.json .
 COPY configs ./configs
 COPY --from=pruner /app/scripts/postinstall-patch-next-async-debug-info.mjs /app/scripts/check-package-manager.mjs ./scripts/
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
-
-# copy over the rest of the code for the build
 COPY --from=pruner /app/out/full/ .
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
 # Dashboard still needs standalone output for its Next.js build
 ENV NEXT_CONFIG_OUTPUT=standalone

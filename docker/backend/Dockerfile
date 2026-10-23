@@ -44,6 +44,8 @@ FROM base AS builder
 # Skip generate-sdks.ts in preinstall hook (file not available in pruned output)
 ENV HEXCLAVE_SKIP_TEMPLATE_GENERATION=true
 
+# Install after the final source copy so pnpm's patch-file freshness check sees
+# the same files at install and build time, including when Docker reuses layers.
 COPY --from=pruner /app/out/json/ .
 COPY --from=pruner /app/out/pnpm-lock.yaml .
 COPY .gitignore .
@@ -51,9 +53,8 @@ COPY pnpm-workspace.yaml .
 COPY turbo.json .
 COPY configs ./configs
 COPY --from=pruner /app/scripts/postinstall-patch-next-async-debug-info.mjs /app/scripts/check-package-manager.mjs ./scripts/
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
-
 COPY --from=pruner /app/out/full/ .
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
 # Build backend only
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm turbo run docker-build --filter=@hexclave/backend...
