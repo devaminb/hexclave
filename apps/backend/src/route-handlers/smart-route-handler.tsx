@@ -92,7 +92,11 @@ export function handleApiRequest(handler: (req: Request, options: any, requestId
       const requestUrl = new URL(req.url);
       // The route pattern (not the concrete path — see RequestContext.normalizedPath for why).
       // Optional access because unit tests may invoke handlers outside the server dispatcher.
-      const normalizedPath = requestContextALS.getStore()?.normalizedPath;
+      const requestContext = requestContextALS.getStore();
+      if (requestContext != null) {
+        requestContext.requestId = requestId;
+      }
+      const normalizedPath = requestContext?.normalizedPath;
       const host = getInboundRequestHost(req);
       // Sentry's httpIntegration already forks an isolation scope per incoming request (which is
       // what keeps concurrent requests on Fluid Compute / Cloud Run from leaking context into each

@@ -16,6 +16,8 @@ export type ResponseCookieOptions = {
 };
 
 export type RequestContext = {
+  /** Matches the response request ID, including in tracked background tasks. */
+  requestId?: string,
   /** The inbound client signal. This is deliberately independent of deployment-duration limits. */
   abortSignal: AbortSignal,
   headers: Headers,

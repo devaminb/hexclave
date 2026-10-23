@@ -7,6 +7,8 @@ import { getEnvBoolean, getEnvVariable } from '@hexclave/shared/dist/utils/env';
 import { HexclaveAssertionError } from '@hexclave/shared/dist/utils/errors';
 import { escapeHtml } from '@hexclave/shared/dist/utils/html';
 import { Json } from '@hexclave/shared/dist/utils/json';
+import { Result } from '@hexclave/shared/dist/utils/results';
+import { createEmailSendDiagnosticLogger } from './email-send-diagnostics';
 import { runEmailQueueStep, serializeRecipient } from './email-queue-step';
 import { LowLevelEmailConfig, isSecureEmailPort, lowLevelSendEmailDirectWithoutRetries } from './emails-low-level';
 import { Tenancy } from './tenancies';
@@ -96,32 +98,38 @@ function getDefaultAuthEmailContent(templateType: keyof typeof DEFAULT_TEMPLATE_
       link = requireString('magicLink');
       break;
     }
-    case 'password_reset':
+    case 'password_reset': {
       subject = `Reset your password at ${projectName}`;
       paragraphs = [`Use this link to reset your password for ${projectName}:`];
       link = requireString('passwordResetLink');
       break;
-    case 'email_verification':
+    }
+    case 'email_verification': {
       subject = `Verify your email at ${projectName}`;
       paragraphs = [`Use this link to verify your email address for ${projectName}:`];
       link = requireString('emailVerificationLink');
       break;
-    case 'team_invitation':
+    }
+    case 'team_invitation': {
       subject = `You have been invited to join ${requireString('teamDisplayName')}`;
       paragraphs = [`Use this link to accept your invitation to ${requireString('teamDisplayName')}:`];
       link = requireString('teamInvitationLink');
       break;
-    case 'sign_in_invitation':
+    }
+    case 'sign_in_invitation': {
       subject = `You have been invited to sign in to ${projectName}`;
       paragraphs = [`You have been invited to sign in to ${projectName}. Use this link:`];
       link = requireString('signInInvitationLink');
       break;
+    }
     case 'payment_receipt':
     case 'payment_failed':
-    case 'trial_will_end':
+    case 'trial_will_end': {
       return null;
-    default:
+    }
+    default: {
       throw new HexclaveAssertionError('Unknown default email template', { templateType: templateType satisfies never });
+    }
   }
 
   const footer = 'If you were not expecting this email, you can safely ignore it.';
@@ -144,21 +152,39 @@ export async function sendEmailFromDefaultTemplate(options: {
   // Temporary renderer bypass for auth/invitation mail. Keep delivery in a tracked
   // background task like the queue path; static content also ignores broken custom
   // templates/themes. Direct SMTP intentionally skips outbox history and retries.
+  const logEmail = createEmailSendDiagnosticLogger(options.templateType);
+  logEmail({ stage: 'preparing' });
   const content = getDefaultAuthEmailContent(options.templateType, options.tenancy.project.display_name, options.extraVariables);
   if (content !== null) {
     runAsynchronouslyAndWaitUntil(async () => {
-      const result = await lowLevelSendEmailDirectWithoutRetries({
+      logEmail({ stage: 'config-loading' });
+      const configResult = await Result.fromPromise(getEmailConfig(options.tenancy));
+      if (configResult.status === 'error') {
+        logEmail({ stage: 'failed', phase: 'configuration', errorType: 'EMAIL_CONFIGURATION_ERROR', canRetry: false });
+        throw configResult.error;
+      }
+      const emailConfig = configResult.data;
+      const transport = { serverType: emailConfig.type, smtpPort: emailConfig.port, secure: emailConfig.secure };
+      logEmail({ stage: 'smtp-started', ...transport });
+      const sendResult = await Result.fromPromise(lowLevelSendEmailDirectWithoutRetries({
         tenancyId: options.tenancy.id,
-        emailConfig: await getEmailConfig(options.tenancy),
+        emailConfig,
         to: options.email,
         ...content,
-      });
+      }));
+      if (sendResult.status === 'error') {
+        logEmail({ stage: 'failed', phase: 'smtp', errorType: 'SMTP_EXCEPTION', canRetry: false });
+        throw sendResult.error;
+      }
+      const result = sendResult.data;
       if (result.status === 'error') {
+        logEmail({ stage: 'failed', phase: 'smtp', errorType: result.error.errorType, canRetry: result.error.canRetry });
         throw new HexclaveAssertionError('Failed to send default email without rendering', {
           templateType: options.templateType,
           errorType: result.error.errorType,
         });
       }
+      logEmail({ stage: 'smtp-accepted', ...transport });
       console.info('Sent default email without rendering.', { templateType: options.templateType });
     });
     return;

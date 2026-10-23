@@ -1,4 +1,5 @@
 import { getAuthContactChannelWithEmailNormalization } from "@/lib/contact-channel";
+import { createEmailSendDiagnosticLogger } from "@/lib/email-send-diagnostics";
 import { getPrismaClientForTenancy } from "@/prisma-client";
 import { createSmartRouteHandler } from "@/route-handlers/smart-route-handler";
 import { KnownErrors } from "@hexclave/shared";
@@ -31,7 +32,10 @@ export const POST = createSmartRouteHandler({
     }).defined(),
   }),
   async handler({ auth: { tenancy }, body: { email, callback_url: callbackUrl } }, fullReq) {
+    const logEmail = createEmailSendDiagnosticLogger("password_reset");
+    logEmail({ stage: "requested" });
     if (!tenancy.config.auth.password.allowSignIn) {
+      logEmail({ stage: "skipped", reason: "password-auth-disabled" });
       throw new KnownErrors.PasswordAuthenticationNotEnabled();
     }
 
@@ -47,7 +51,10 @@ export const POST = createSmartRouteHandler({
       },
     );
 
-    if (!contactChannel) {
+    if (contactChannel == null) {
+      // Keep the public response identical whether an account matched or not;
+      // the operator log distinguishes this intentional skip from delivery errors.
+      logEmail({ stage: "skipped", reason: "no-auth-email-match" });
       await wait(2000 + Math.random() * 1000);
       return {
         statusCode: 200,
@@ -57,6 +64,7 @@ export const POST = createSmartRouteHandler({
         },
       };
     }
+    logEmail({ stage: "user-matched" });
     const user = await usersCrudHandlers.adminRead({
       tenancy,
       user_id: contactChannel.projectUserId,
@@ -73,6 +81,7 @@ export const POST = createSmartRouteHandler({
     }, {
       user,
     });
+    logEmail({ stage: "scheduled" });
 
     return {
       statusCode: 200,
